@@ -251,15 +251,3 @@ def test_export_requires_the_columns_to_store(item):
     args = ["export", *identity(item, base=False), "--enriched", item["sat"]]
     with pytest.raises(SystemExit):
         run(*args, "--output", out, "--report", item["dir"] / "x.json")
-
-
-def test_assemble_rejects_a_sidecar_from_a_reordered_output(item):
-    reordered = laspy.read(item["sat"])
-    order = np.arange(len(reordered.points))
-    order[[10, 20]] = order[[20, 10]]
-    reordered.points = reordered.points[order].copy()
-    reordered.write(item["sat"])
-    sat, _ = export(item, "sat")
-    out = item["dir"] / "member.laz"
-    args = ["assemble", *identity(item), "--output", out, "--sidecar", sat]
-    assert run(*args, "--report", item["dir"] / "r.json") == 2

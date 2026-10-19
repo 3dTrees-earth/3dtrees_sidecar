@@ -17,22 +17,19 @@ point cloud, and checking it independently.
   columns named in `--columns`, for example SAT's two columns, a species output's
   own columns, or one method's columns from a combined legacy file. Columns of
   the output that are not named are printed as a warning and listed under
-  `dropped` in the report. The sidecar records a fingerprint of the output's
-  points (`points_sha256`: header, CRS and every standard point field, in order).
+  `dropped` in the report. The output must hold the standardized points in the
+  same order; the sidecar is joined back by point number only.
 - **assemble** keeps every base field unchanged and in order and adds the
-  selected sidecars' columns. It refuses a sidecar whose fingerprint differs from
-  the base, so a method that reordered, dropped or changed points is caught.
-  Any subset is valid (points only, one method, all). Sidecars in point order
-  stream in constant memory.
+  selected sidecars' columns. It refuses a sidecar with another generation,
+  item or point count. Any subset is valid (points only, one method, all).
+  Sidecars in point order stream in constant memory.
 - **check** rebuilds the point cloud from base and sidecars and compares every
   dimension point by point.
 
 Every task writes a JSON report with identities, point count, dimensions and
 SHA-256 hashes, so the 3Dtrees worker verifies stored bytes without downloading
-point clouds. On 85 M points (10 cores) the first version took export 20 s,
-assemble 35 s, check 62 s, each under 0.6 GB of memory and without temporary
-disk; the fingerprint adds one read pass to export and assemble (about 25 % on
-10 M points).
+point clouds. On 85 M points (10 cores): export 20 s, assemble 35 s, check 62 s,
+each under 0.6 GB of memory and without temporary disk.
 
 ## Usage
 

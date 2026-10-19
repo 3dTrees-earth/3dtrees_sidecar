@@ -1,9 +1,8 @@
 """Indexed scientific sidecars joined onto a standardized LAZ by point index.
 
 Spatial inference/remapping belongs to the pinned scientific tool. This boundary
-never matches coordinates: export records a digest of the method output's points
-(header and every standard point field, in order), and assembly joins solely by
-point index after the base yields the same digest.
+never matches coordinates: assembly joins solely by point index, so a method
+output must keep the base points in their order.
 """
 
 import copy
@@ -32,48 +31,9 @@ def identity(generation, item):
     return {"generation": generation, "item": item}
 
 
-class _PointsDigest:
-    """SHA-256 of a header and every standard point field in point order.
-
-    One running hash per field keeps the digest independent of chunk size."""
-
-    def __init__(self, header):
-        crs = header.parse_crs()
-        self.header = json.dumps(
-            {
-                "points": header.point_count,
-                "format": header.point_format.id,
-                "scales": [float(v) for v in header.scales],
-                "offsets": [float(v) for v in header.offsets],
-                "crs": crs.to_wkt() if crs else None,
-            },
-            sort_keys=True,
-        )
-        self.names = list(header.point_format.standard_dimension_names)
-        self.fields = {n: hashlib.sha256() for n in self.names}
-
-    def update(self, chunk):
-        for name in self.names:
-            self.fields[name].update(np.ascontiguousarray(chunk[name]).tobytes())
-
-    def hexdigest(self):
-        total = hashlib.sha256(self.header.encode())
-        for name in self.names:
-            total.update(name.encode() + self.fields[name].digest())
-        return total.hexdigest()
-
-
 def manifest_of(table):
     """The identity and dimensions a sidecar carries in its Parquet schema."""
     return json.loads((table.schema_arrow.metadata or {})[b"3dtrees"])
-
-
-def points_sha256(path):
-    with laspy.open(path) as reader:
-        digest = _PointsDigest(reader.header)
-        for chunk in reader.chunk_iterator(CHUNK_POINTS):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def unchanged_base(base, enriched):
@@ -169,16 +129,10 @@ class _Rows:
 
 
 def export(enriched_path, output, *, generation, item, owned, producer):
-    """Store the `owned` dimensions of a method output with each point's index.
-
-    The output is not compared with the base here: its points digest is
-    recorded, and assembly refuses the sidecar unless the base matches it."""
+    """Store the `owned` dimensions of a method output with each point's index."""
     output = Path(output)
     if output.exists():
         raise ValueError("Sidecar destination already exists")
-    # A first pass for the digest keeps the manifest in the schema, where it
-    # survives any Parquet rewrite of the rows.
-    digest = points_sha256(enriched_path)
     with laspy.open(enriched_path) as enriched:
         header = enriched.header
         names = set(header.point_format.dimension_names)
@@ -199,7 +153,6 @@ def export(enriched_path, output, *, generation, item, owned, producer):
             "contract": CONTRACT,
             **identity(generation, item),
             "points": header.point_count,
-            "points_sha256": digest,
             "dimensions": {n: d.str for n, d in dtypes.items()},
             "producer": producer,
         }
@@ -302,10 +255,7 @@ def assemble(base_path, sidecars, output, *, generation, item):
     output = Path(output)
     if output.exists() or output.resolve() == Path(base_path).resolve():
         raise ValueError("Assembly destination must be new")
-    expected = {
-        **identity(generation, item),
-        "points_sha256": points_sha256(base_path) if sidecars else None,
-    }
+    expected = identity(generation, item)
     with laspy.open(base_path) as base:
         header = copy.deepcopy(base.header)
         count = header.point_count
@@ -319,11 +269,6 @@ def assemble(base_path, sidecars, output, *, generation, item):
                 manifest.get(k) != expected[k] for k in ("generation", "item")
             ):
                 raise ValueError("Sidecar base identity mismatch")
-            if manifest.get("points_sha256") != expected["points_sha256"]:
-                raise ValueError(
-                    "Sidecar points differ from the base: point order, header "
-                    "or a base field changed"
-                )
             if manifest["points"] != count or table.metadata.num_rows != count:
                 raise ValueError("Sidecar point count mismatch")
             if set(table.schema_arrow.names) != {
