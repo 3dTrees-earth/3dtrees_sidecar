@@ -20,7 +20,7 @@ from uuid import UUID
 import sidecar
 
 TOOL = "3dtrees_sidecar"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CHECK_CONTRACT = "3dtrees-sidecar-check-v1"
 
 
@@ -35,6 +35,21 @@ def generation_id(value):
         return str(UUID(value))
     except ValueError as error:
         raise argparse.ArgumentTypeError("generation must be a UUID") from error
+
+
+class Column(argparse.Action):
+    """`--column` starts a kept dimension; `--description` and `--no-data`
+    set an attribute of the column named just before them."""
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        columns = getattr(namespace, self.dest) or []
+        if self.const is None:
+            columns.append({"name": value})
+        elif not columns:
+            parser.error(f"{option_string} must follow a --column")
+        else:
+            columns[-1][self.const] = value
+        setattr(namespace, self.dest, columns)
 
 
 def manifest_of(path):
@@ -63,12 +78,18 @@ def added_dimensions(base, enriched, carried):
 
 def export(args):
     added = added_dimensions(args.base, args.enriched, args.carried)
-    # `--columns` splits a combined file (a legacy analysis holding SAT and
+    # Naming columns splits a combined file (a legacy analysis holding SAT and
     # ForestMamba) into one sidecar per method; the rest is left to its own.
-    owned = sorted(args.columns) if args.columns else added
+    columns = args.columns or []
+    owned = sorted(c["name"] for c in columns) if columns else added
+    if len(set(owned)) != len(owned):
+        raise ValueError("A column is named more than once")
     missing = set(owned) - set(added)
     if missing:
         raise ValueError(f"Requested columns are not in the output: {sorted(missing)}")
+    attributes = {
+        c["name"]: {k: v for k, v in c.items() if k != "name"} for c in columns
+    }
     manifest = sidecar.export(
         args.base,
         args.enriched,
@@ -78,6 +99,7 @@ def export(args):
         owned=owned,
         carried=args.carried,
         ignored=sorted(set(added) - set(owned)),
+        attributes=attributes,
         producer={"executor": "galaxy", "tool": TOOL, "version": VERSION},
     )
     write_report(args.report, {"item_id": args.item, **manifest})
@@ -130,6 +152,9 @@ def check(args):
             points = actual.header.point_count
             if points != reference.header.point_count:
                 raise ValueError("Member point count differs")
+        attributes = sidecar.stored_attributes(expected)
+        if sidecar.stored_attributes(args.member) != attributes:
+            raise ValueError("Member column descriptions or no-data values differ")
         # Every dimension of the rebuilt file (base fields and each selected
         # scientific column), point by point and in order.
         sidecar.unchanged_files(expected, args.member)
@@ -172,9 +197,27 @@ def parser():
     one.add_argument("--carried", help="Parent sidecar the method output repeats")
     one.add_argument("--output", required=True, help="Sidecar Parquet path")
     one.add_argument(
-        "--columns",
-        type=lambda value: [c for c in value.split(",") if c],
-        help="Comma-separated dimensions to keep (default: every added one)",
+        "--column",
+        dest="columns",
+        action=Column,
+        metavar="NAME",
+        help="Dimension to keep; repeat for each (default: every added one)",
+    )
+    one.add_argument(
+        "--description",
+        dest="columns",
+        action=Column,
+        const="description",
+        metavar="TEXT",
+        help="Description of the preceding --column (ASCII, at most 32 characters)",
+    )
+    one.add_argument(
+        "--no-data",
+        dest="columns",
+        action=Column,
+        const="no_data",
+        metavar="VALUE",
+        help="No-data value of the preceding --column",
     )
     one.set_defaults(handler=export)
 

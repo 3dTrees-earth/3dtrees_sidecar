@@ -201,7 +201,9 @@ def test_columns_split_a_combined_legacy_file_into_one_sidecar_per_method(item):
     for kind, columns in (("sat", SAT), ("forestmamba", FM)):
         out = item["dir"] / f"legacy-{kind}.parquet"
         args = ["export", *identity(item), "--enriched", item["legacy"]]
-        args += ["--columns", ",".join(columns), "--output", out]
+        for name in columns:
+            args += ["--column", name]
+        args += ["--output", out]
         assert run(*args, "--report", item["dir"] / f"legacy-{kind}.json") == 0
         assert tool.manifest_of(out)["dimensions"].keys() == columns.keys()
         sidecars.append(out)
@@ -215,7 +217,7 @@ def test_columns_split_a_combined_legacy_file_into_one_sidecar_per_method(item):
 def test_columns_must_exist_in_the_output(item):
     out = item["dir"] / "x.parquet"
     args = ["export", *identity(item), "--enriched", item["sat"]]
-    args += ["--columns", "PredInstance_FM", "--output", out]
+    args += ["--column", "PredInstance_FM", "--output", out]
     assert run(*args, "--report", item["dir"] / "x.json") == 2
 
 
@@ -226,3 +228,97 @@ def test_sidecars_store_the_index_delta_encoded_in_large_row_groups(item):
     index = metadata.row_group(0).column(0)
     assert index.path_in_schema == "point_index"
     assert "DELTA_BINARY_PACKED" in index.encodings
+
+
+def described(item):
+    # A method output that labels its columns in the LAS extra-bytes records.
+    cloud = laspy.read(item["base"])
+    rng = np.random.default_rng(5)
+    cloud.add_extra_dim(
+        laspy.ExtraBytesParams(
+            "PredInstance_SAT", np.uint32, description="Tree from file", no_data=[0]
+        )
+    )
+    cloud.add_extra_dim(laspy.ExtraBytesParams("PredSemantic_SAT", np.uint32))
+    cloud.PredInstance_SAT = rng.integers(0, 50, len(cloud.points)).astype(np.uint32)
+    cloud.PredSemantic_SAT = rng.integers(0, 5, len(cloud.points)).astype(np.uint32)
+    item["described"] = item["dir"] / "described.laz"
+    cloud.write(item["described"])
+    return item["described"]
+
+
+def test_file_attributes_reach_the_member_unless_set_manually(item):
+    out = item["dir"] / "attributed.parquet"
+    args = ["export", *identity(item), "--enriched", described(item)]
+    args += ["--column", "PredInstance_SAT", "--no-data", "4294967295"]
+    args += ["--column", "PredSemantic_SAT", "--description", "Semantic class"]
+    args += ["--no-data", "-0"]
+    assert run(*args, "--output", out, "--report", item["dir"] / "a.json") == 0
+    assert tool.manifest_of(out)["attributes"] == {
+        "PredInstance_SAT": {"description": "Tree from file", "no_data": 4294967295},
+        "PredSemantic_SAT": {"description": "Semantic class", "no_data": 0},
+    }
+    member, _ = assemble(item, [out])
+    assert tool.sidecar.stored_attributes(member) == tool.manifest_of(out)["attributes"]
+    assert check(item, [out], member) == 0
+
+
+def test_check_rejects_a_member_with_changed_attributes(item):
+    out = item["dir"] / "attributed.parquet"
+    args = ["export", *identity(item), "--enriched", described(item)]
+    assert run(*args, "--output", out, "--report", item["dir"] / "a.json") == 0
+    member, _ = assemble(item, [out])
+    # Same values, but the manifest no longer carries the attributes.
+    table = pq.read_table(out)
+    manifest = tool.manifest_of(out)
+    manifest["attributes"] = {}
+    stripped = item["dir"] / "stripped.parquet"
+    pq.write_table(
+        table.replace_schema_metadata({b"3dtrees": json.dumps(manifest).encode()}),
+        stripped,
+    )
+    plain, _ = assemble(item, [stripped], name="plain")
+    assert check(item, [stripped], plain) == 0
+    assert check(item, [out], plain) == 2
+    assert check(item, [out], member) == 0
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        ["--no-data", "-1"],
+        ["--no-data", "1.5"],
+        ["--no-data", "none"],
+        ["--description", "x" * 33],
+        ["--description", "Baumhöhe"],
+    ],
+)
+def test_attributes_that_las_cannot_store_are_rejected(item, attribute):
+    out = item["dir"] / "bad.parquet"
+    args = ["export", *identity(item), "--enriched", item["sat"]]
+    args += ["--column", "PredInstance_SAT", *attribute, "--column", "PredSemantic_SAT"]
+    assert run(*args, "--output", out, "--report", item["dir"] / "bad.json") == 2
+    assert not out.exists()
+
+
+def test_attributes_need_a_preceding_column(item):
+    args = ["export", *identity(item), "--enriched", item["sat"], "--no-data", "0"]
+    with pytest.raises(SystemExit):
+        run(
+            *args,
+            "--output",
+            item["dir"] / "x.parquet",
+            "--report",
+            item["dir"] / "x.json",
+        )
+
+
+def test_float_no_data_is_stored_as_its_float32_value(item):
+    out = item["dir"] / "fm.parquet"
+    args = ["export", *identity(item), "--enriched", item["forestmamba"]]
+    args += ["--column", "PredScore_FM", "--no-data", "-1.5"]
+    args += ["--column", "PredInstance_FM", "--column", "PredSemantic_FM"]
+    assert run(*args, "--output", out, "--report", item["dir"] / "fm.json") == 0
+    assert tool.manifest_of(out)["attributes"] == {"PredScore_FM": {"no_data": -1.5}}
+    member, _ = assemble(item, [out])
+    assert tool.sidecar.stored_attributes(member)["PredScore_FM"] == {"no_data": -1.5}

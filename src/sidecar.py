@@ -31,6 +31,67 @@ def identity(base, generation, item):
     return {"generation": generation, "item": item, "base_sha256": sha256(base)}
 
 
+# LAS stores an extra dimension's description in 32 bytes.
+DESCRIPTION_BYTES = 32
+
+
+def stored_attributes(path):
+    """Each extra dimension's description and no-data value as the file stores
+    them. laspy drops no-data values when it reads a header, so read the VLR."""
+    with laspy.open(path) as reader:
+        vlrs = reader.header.vlrs.get("ExtraBytesVlr")
+    attributes = {}
+    for struct in vlrs[0].extra_bytes_structs if vlrs else []:
+        entry = {}
+        description = struct.description.rstrip(b"\0").decode(errors="replace")
+        if description:
+            entry["description"] = description
+        # NaN cannot mark missing values: NaN never equals a point's value.
+        if struct.no_data is not None and np.isfinite(struct.no_data[0]):
+            entry["no_data"] = struct.no_data[0].item()
+        attributes[struct.format_name()] = entry
+    return attributes
+
+
+def _no_data(value, dtype, name):
+    if dtype.kind == "f":
+        try:
+            number = dtype.type(value)
+        except (TypeError, ValueError):
+            number = None
+        if number is None or not np.isfinite(number):
+            raise ValueError(f"No-data value must be a finite number: {name}")
+        return number.item()
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = None
+    if number is None or not np.iinfo(dtype).min <= number <= np.iinfo(dtype).max:
+        raise ValueError(f"No-data value does not fit {dtype}: {name}")
+    return number
+
+
+def checked_attributes(attributes, dtypes):
+    """Description and no-data value per owned dimension, valid as LAS extra bytes."""
+    checked = {}
+    for name, entry in attributes.items():
+        if name not in dtypes or set(entry) - {"description", "no_data"}:
+            raise ValueError(f"Attributes name an unknown dimension or key: {name}")
+        result = {}
+        if entry.get("description"):
+            description = entry["description"]
+            if not description.isascii() or len(description) > DESCRIPTION_BYTES:
+                raise ValueError(
+                    f"Description must be ASCII and at most 32 characters: {name}"
+                )
+            result["description"] = description
+        if entry.get("no_data") is not None:
+            result["no_data"] = _no_data(entry["no_data"], dtypes[name], name)
+        if result:
+            checked[name] = result
+    return checked
+
+
 def unchanged_base(base, enriched):
     if (
         len(base.points) != len(enriched.points)
@@ -142,13 +203,17 @@ def export(
     producer,
     carried=None,
     ignored=(),
+    attributes=None,
 ):
     """`carried` is the retained parent sidecar whose dimensions the enriched
     file repeats (species remaps repeat their segmentation's labels). Each
     repeated column must equal the parent point for point; it is then dropped.
 
     `ignored` names added dimensions that belong to another method, so one
-    combined file (a legacy analysis) can be split into one sidecar per method."""
+    combined file (a legacy analysis) can be split into one sidecar per method.
+
+    `attributes` sets an owned dimension's description and no-data value; each
+    one given replaces what the enriched file stores for that dimension."""
     output = Path(output)
     if output.exists():
         raise ValueError("Sidecar destination already exists")
@@ -184,11 +249,19 @@ def export(
             for n, d in dtypes.items()
         ):
             raise ValueError("Only scalar numeric owned dimensions are supported")
+        attributes = attributes or {}
+        if set(attributes) - set(owned):
+            raise ValueError("Attributes name a dimension the sidecar does not own")
+        stored = stored_attributes(enriched_path)
         manifest = {
             "contract": CONTRACT,
             **identity(base_path, generation, item),
             "points": base.header.point_count,
             "dimensions": {n: d.str for n, d in dtypes.items()},
+            "attributes": checked_attributes(
+                {n: {**stored.get(n, {}), **attributes.get(n, {})} for n in owned},
+                dtypes,
+            ),
             "producer": producer,
         }
         schema = pa.schema(
@@ -326,8 +399,19 @@ def assemble(base_path, sidecars, output, *, generation, item):
                     raise ValueError("Scientific dimension ownership collision")
                 if dtype.subdtype or dtype.kind not in "iuf":
                     raise ValueError("Scientific dimension dtype mismatch")
-                header.add_extra_dim(laspy.ExtraBytesParams(name=name, type=dtype))
                 dtypes[name] = dtype
+            # Sidecars written before column attributes existed carry none.
+            attributes = checked_attributes(manifest.get("attributes", {}), dtypes)
+            for name, dtype in dtypes.items():
+                entry = attributes.get(name, {})
+                header.add_extra_dim(
+                    laspy.ExtraBytesParams(
+                        name=name,
+                        type=dtype,
+                        description=entry.get("description", ""),
+                        no_data=[entry["no_data"]] if "no_data" in entry else None,
+                    )
+                )
             tables.append((path, table, dtypes))
         streamed = False
         if all(_in_point_order(table, count) for _, table, _ in tables):
