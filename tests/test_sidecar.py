@@ -34,9 +34,8 @@ def cloud(tmp_path):
 
 
 def save(cloud, path):
-    source, enriched, identity = cloud
+    _, enriched, identity = cloud
     return export(
-        source,
         enriched,
         path,
         **identity,
@@ -68,8 +67,10 @@ def test_reordered_remap_output_is_rejected_even_with_duplicate_xyz(cloud, tmp_p
     result = laspy.read(enriched)
     result.points = result.points[[1, 0, 2, 3, 4, 5]].copy()
     result.write(enriched)
+    sidecar = tmp_path / "bad.parquet"
+    save(cloud, sidecar)
     with pytest.raises(ValueError, match="point order"):
-        save(cloud, tmp_path / "bad.parquet")
+        assemble(source, [sidecar], tmp_path / "bad.laz", **identity)
 
 
 @pytest.mark.parametrize("indices", [[0, 0, 2, 3, 4, 5], [0, 1, 2, 3, 4, 6]])
@@ -84,18 +85,21 @@ def test_missing_duplicate_and_out_of_range_indices_fail(cloud, tmp_path, indice
         assemble(source, [sidecar], tmp_path / "bad.laz", **identity)
 
 
-@pytest.mark.parametrize("change", ["item", "generation", "bytes"])
-def test_wrong_base_identity_fails(cloud, tmp_path, change):
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [("item", "base identity"), ("generation", "base identity"), ("field", "differ")],
+)
+def test_wrong_base_identity_fails(cloud, tmp_path, change, message):
     source, _, identity = cloud
     sidecar = tmp_path / "sat.parquet"
     save(cloud, sidecar)
-    if change == "bytes":
+    if change == "field":
         data = laspy.read(source)
         data.intensity[0] += 1
         data.write(source)
     else:
         identity[change] = 2 if change == "item" else str(uuid4())
-    with pytest.raises(ValueError, match="base identity"):
+    with pytest.raises(ValueError, match=message):
         assemble(source, [sidecar], tmp_path / "bad.laz", **identity)
 
 
@@ -112,8 +116,10 @@ def test_changed_geometry_is_not_silently_coordinate_joined(cloud, tmp_path):
     changed = laspy.read(enriched)
     changed.header.offsets[0] += 1
     changed.write(enriched)
-    with pytest.raises(ValueError, match="geometry/header"):
-        save(cloud, tmp_path / "bad.parquet")
+    sidecar = tmp_path / "bad.parquet"
+    save(cloud, sidecar)
+    with pytest.raises(ValueError, match="differ from the base"):
+        assemble(source, [sidecar], tmp_path / "bad.laz", **identity)
 
 
 def test_existing_artifacts_are_not_overwritten(cloud, tmp_path):
@@ -137,7 +143,6 @@ def test_independent_methods_assemble_without_changing_base(cloud, tmp_path):
     base.write(species_laz)
     species = tmp_path / "species.parquet"
     export(
-        source,
         species_laz,
         species,
         **identity,
@@ -157,8 +162,10 @@ def test_changed_crs_rejected(cloud, tmp_path):
     result = laspy.read(enriched)
     result.header.add_crs(CRS.from_epsg(32633))
     result.write(enriched)
-    with pytest.raises(ValueError, match="geometry/header"):
-        save(cloud, tmp_path / "bad.parquet")
+    sidecar = tmp_path / "bad.parquet"
+    save(cloud, sidecar)
+    with pytest.raises(ValueError, match="differ from the base"):
+        assemble(source, [sidecar], tmp_path / "bad.laz", **identity)
 
 
 def test_chunk_boundaries_preserve_reordered_rows_and_reject_cross_batch_duplicates(
@@ -225,3 +232,16 @@ def test_rows_that_only_look_ordered_fall_back_to_the_indexed_path(
     assert np.array_equal(
         laspy.read(output).PredInstance_SAT, laspy.read(enriched).PredInstance_SAT
     )
+
+
+def test_only_named_numeric_extra_dimensions_can_be_stored(cloud, tmp_path):
+    _, enriched, identity = cloud
+    for owned in (["intensity"], ["missing"], []):
+        with pytest.raises(ValueError):
+            export(
+                enriched,
+                tmp_path / f"bad-{len(owned)}-{owned}.parquet",
+                **identity,
+                owned=owned,
+                producer={},
+            )

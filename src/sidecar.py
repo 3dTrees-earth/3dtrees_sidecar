@@ -1,8 +1,9 @@
-"""Indexed scientific sidecar proof against exact standardized LAZ bytes.
+"""Indexed scientific sidecars joined onto a standardized LAZ by point index.
 
 Spatial inference/remapping belongs to the pinned scientific tool. This boundary
-never matches coordinates: it verifies the remapped base order before assigning
-point indices, then assembles solely by those indices and the frozen base hash.
+never matches coordinates: export records a digest of the method output's points
+(header and every standard point field, in order), and assembly joins solely by
+point index after the base yields the same digest.
 """
 
 import copy
@@ -16,7 +17,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-CONTRACT = "3dtrees-scientific-sidecar-proof-v1"
+CONTRACT = "3dtrees-scientific-sidecar-proof-v2"
 
 
 def sha256(path):
@@ -24,11 +25,55 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def identity(base, generation, item):
+def identity(generation, item):
     UUID(generation)
     if not isinstance(item, int) or item < 1:
         raise ValueError("A positive dataset-item identity is required")
-    return {"generation": generation, "item": item, "base_sha256": sha256(base)}
+    return {"generation": generation, "item": item}
+
+
+class _PointsDigest:
+    """SHA-256 of a header and every standard point field in point order.
+
+    One running hash per field keeps the digest independent of chunk size."""
+
+    def __init__(self, header):
+        crs = header.parse_crs()
+        self.header = json.dumps(
+            {
+                "points": header.point_count,
+                "format": header.point_format.id,
+                "scales": [float(v) for v in header.scales],
+                "offsets": [float(v) for v in header.offsets],
+                "crs": crs.to_wkt() if crs else None,
+            },
+            sort_keys=True,
+        )
+        self.names = list(header.point_format.standard_dimension_names)
+        self.fields = {n: hashlib.sha256() for n in self.names}
+
+    def update(self, chunk):
+        for name in self.names:
+            self.fields[name].update(np.ascontiguousarray(chunk[name]).tobytes())
+
+    def hexdigest(self):
+        total = hashlib.sha256(self.header.encode())
+        for name in self.names:
+            total.update(name.encode() + self.fields[name].digest())
+        return total.hexdigest()
+
+
+def manifest_of(table):
+    """The identity and dimensions a sidecar carries in its Parquet schema."""
+    return json.loads((table.schema_arrow.metadata or {})[b"3dtrees"])
+
+
+def points_sha256(path):
+    with laspy.open(path) as reader:
+        digest = _PointsDigest(reader.header)
+        for chunk in reader.chunk_iterator(CHUNK_POINTS):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def unchanged_base(base, enriched):
@@ -101,7 +146,7 @@ class _Rows:
             if not self.pending:
                 batch = next(self.batches, None)
                 if batch is None:
-                    raise ValueError("Carried parent sidecar is shorter than the base")
+                    raise ValueError("Sidecar rows are fewer than the base points")
                 self.pending = [batch]
             batch = self.pending.pop()
             parts.append(batch.slice(0, needed))
@@ -112,7 +157,7 @@ class _Rows:
         indices = table["point_index"].to_numpy()
         expected = np.arange(self.offset, self.offset + count, dtype=np.uint64)
         if table["point_index"].null_count or not np.array_equal(indices, expected):
-            raise ValueError("Carried parent sidecar is not in point order")
+            raise ValueError("Sidecar rows are not in point order")
         self.offset += count
         # Callers that require complete values check this before using them.
         self.missing = [n for n in self.columns if table[n].null_count]
@@ -120,64 +165,30 @@ class _Rows:
 
     def finish(self):
         if self.pending or next(self.batches, None) is not None:
-            raise ValueError("Carried parent sidecar is longer than the base")
+            raise ValueError("Sidecar rows are more than the base points")
 
 
-def _same_values(name, expected, actual):
-    floating = expected.dtype.kind == "f" and actual.dtype.kind == "f"
-    if expected.shape != actual.shape or not np.array_equal(
-        expected, actual, equal_nan=floating
-    ):
-        raise ValueError(f"Carried dimension differs from its retained parent: {name}")
+def export(enriched_path, output, *, generation, item, owned, producer):
+    """Store the `owned` dimensions of a method output with each point's index.
 
-
-def export(
-    base_path,
-    enriched_path,
-    output,
-    *,
-    generation,
-    item,
-    owned,
-    producer,
-    carried=None,
-    ignored=(),
-):
-    """`carried` is the retained parent sidecar whose dimensions the enriched
-    file repeats (species remaps repeat their segmentation's labels). Each
-    repeated column must equal the parent point for point; it is then dropped.
-
-    `ignored` names added dimensions that belong to another method, so one
-    combined file (a legacy analysis) can be split into one sidecar per method."""
+    The output is not compared with the base here: its points digest is
+    recorded, and assembly refuses the sidecar unless the base matches it."""
     output = Path(output)
     if output.exists():
         raise ValueError("Sidecar destination already exists")
-    parent = []
-    if carried is not None:
-        metadata = json.loads(
-            (pq.ParquetFile(carried).schema_arrow.metadata or {})[b"3dtrees"]
-        )
-        parent = list(metadata["dimensions"])
-        if metadata.get("contract") != CONTRACT or any(
-            metadata.get(k) != v
-            for k, v in identity(base_path, generation, item).items()
-        ):
-            raise ValueError("Carried parent sidecar base identity mismatch")
-    with laspy.open(base_path) as base, laspy.open(enriched_path) as enriched:
-        same_header(base.header, enriched.header)
-        dimensions = list(base.header.point_format.dimension_names)
-        added = set(enriched.header.point_format.dimension_names) - set(dimensions)
-        if (
-            not owned
-            or len(set(owned)) != len(owned)
-            or set(owned) & set(parent)
-            or set(ignored) & (set(owned) | set(parent))
-            or added != set(owned) | set(parent) | set(ignored)
-        ):
-            raise ValueError("Owned dimensions must match exactly the added dimensions")
+    # A first pass for the digest keeps the manifest in the schema, where it
+    # survives any Parquet rewrite of the rows.
+    digest = points_sha256(enriched_path)
+    with laspy.open(enriched_path) as enriched:
+        header = enriched.header
+        names = set(header.point_format.dimension_names)
+        standard = set(header.point_format.standard_dimension_names)
+        if not owned or len(set(owned)) != len(owned) or not set(owned) <= names:
+            raise ValueError("Owned dimensions must be named dimensions of the output")
+        if set(owned) & standard:
+            raise ValueError("Standard point fields cannot be owned")
         dtypes = {
-            n: np.dtype(enriched.header.point_format.dimension_by_name(n).dtype)
-            for n in owned
+            n: np.dtype(header.point_format.dimension_by_name(n).dtype) for n in owned
         }
         if any(
             n == "point_index" or d.subdtype or d.kind not in "iuf"
@@ -186,8 +197,9 @@ def export(
             raise ValueError("Only scalar numeric owned dimensions are supported")
         manifest = {
             "contract": CONTRACT,
-            **identity(base_path, generation, item),
-            "points": base.header.point_count,
+            **identity(generation, item),
+            "points": header.point_count,
+            "points_sha256": digest,
             "dimensions": {n: d.str for n, d in dtypes.items()},
             "producer": producer,
         }
@@ -197,7 +209,6 @@ def export(
             metadata={b"3dtrees": json.dumps(manifest, sort_keys=True).encode()},
         )
         offset = 0
-        rows = _Rows(carried, parent) if parent else None
         pending = []
         # The index is 0..n-1 in point order: delta encoding stores it almost
         # for free, while assembly keeps verifying every row's identity.
@@ -208,18 +219,13 @@ def export(
             use_dictionary=list(owned),
             column_encoding={"point_index": "DELTA_BINARY_PACKED"},
         ) as writer:
-            for chunk in base.chunk_iterator(CHUNK_POINTS):
-                result = enriched.read_points(len(chunk))
-                same_points(chunk, result, dimensions)
-                if rows is not None:
-                    for name, values in rows.take(len(chunk)).items():
-                        _same_values(name, values, np.asarray(result[name]))
+            for chunk in enriched.chunk_iterator(CHUNK_POINTS):
                 columns = {
                     "point_index": np.arange(
                         offset, offset + len(chunk), dtype=np.uint64
                     )
                 }
-                columns.update({n: np.asarray(result[n]) for n in owned})
+                columns.update({n: np.asarray(chunk[n]) for n in owned})
                 pending.append(pa.table(columns, schema=schema))
                 offset += len(chunk)
                 if sum(len(t) for t in pending) >= ROW_GROUP_POINTS:
@@ -231,8 +237,6 @@ def export(
                 writer.write_table(
                     pa.concat_tables(pending), row_group_size=ROW_GROUP_POINTS
                 )
-        if rows is not None:
-            rows.finish()
     return {
         **manifest,
         "sidecar_sha256": sha256(output),
@@ -298,7 +302,10 @@ def assemble(base_path, sidecars, output, *, generation, item):
     output = Path(output)
     if output.exists() or output.resolve() == Path(base_path).resolve():
         raise ValueError("Assembly destination must be new")
-    expected = identity(base_path, generation, item)
+    expected = {
+        **identity(generation, item),
+        "points_sha256": points_sha256(base_path) if sidecars else None,
+    }
     with laspy.open(base_path) as base:
         header = copy.deepcopy(base.header)
         count = header.point_count
@@ -307,11 +314,16 @@ def assemble(base_path, sidecars, output, *, generation, item):
         tables = []
         for path in sidecars:
             table = pq.ParquetFile(path)
-            manifest = json.loads((table.schema_arrow.metadata or {})[b"3dtrees"])
+            manifest = manifest_of(table)
             if manifest.get("contract") != CONTRACT or any(
-                manifest.get(k) != v for k, v in expected.items()
+                manifest.get(k) != expected[k] for k in ("generation", "item")
             ):
                 raise ValueError("Sidecar base identity mismatch")
+            if manifest.get("points_sha256") != expected["points_sha256"]:
+                raise ValueError(
+                    "Sidecar points differ from the base: point order, header "
+                    "or a base field changed"
+                )
             if manifest["points"] != count or table.metadata.num_rows != count:
                 raise ValueError("Sidecar point count mismatch")
             if set(table.schema_arrow.names) != {
