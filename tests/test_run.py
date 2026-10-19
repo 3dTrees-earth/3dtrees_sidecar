@@ -82,10 +82,9 @@ def run(*argv):
     return tool.main([str(a) for a in argv])
 
 
-def identity(item):
+def identity(item, base=True):
     return [
-        "--base",
-        item["base"],
+        *(["--base", item["base"]] if base else []),
         "--generation",
         item["generation"],
         "--item",
@@ -93,12 +92,14 @@ def identity(item):
     ]
 
 
-def export(item, kind, carried=None):
+COLUMNS = {"sat": SAT, "forestmamba": FM, "species_sat": SPECIES_SAT}
+
+
+def export(item, kind):
     out = item["dir"] / f"{kind}.parquet"
-    args = ["export", *identity(item), "--enriched", item[kind], "--output", out]
+    args = ["export", *identity(item, base=False), "--enriched", item[kind]]
+    args += ["--columns", ",".join(COLUMNS[kind]), "--output", out]
     args += ["--report", item["dir"] / f"{kind}.json"]
-    if carried:
-        args += ["--carried", carried]
     assert run(*args) == 0
     return out, json.loads((item["dir"] / f"{kind}.json").read_text())
 
@@ -130,10 +131,14 @@ def test_export_derives_owned_columns_and_reports_identity(item):
     assert report["producer"]["tool"] == "3dtrees_sidecar"
 
 
-def test_species_export_drops_the_carried_segmentation_columns(item):
+def test_species_export_keeps_only_its_own_columns_and_assembles_with_sat(item):
     sat, _ = export(item, "sat")
-    _, report = export(item, "species_sat", carried=sat)
+    species, report = export(item, "species_sat")
     assert sorted(report["dimensions"]) == sorted(SPECIES_SAT)
+    member, _ = assemble(item, [sat, species])
+    actual, enriched = laspy.read(member), laspy.read(item["species_sat"])
+    for name in [*SAT, *SPECIES_SAT]:
+        assert np.array_equal(actual[name], enriched[name])
 
 
 @pytest.mark.parametrize(
@@ -200,7 +205,7 @@ def test_columns_split_a_combined_legacy_file_into_one_sidecar_per_method(item):
     sidecars = []
     for kind, columns in (("sat", SAT), ("forestmamba", FM)):
         out = item["dir"] / f"legacy-{kind}.parquet"
-        args = ["export", *identity(item), "--enriched", item["legacy"]]
+        args = ["export", *identity(item, base=False), "--enriched", item["legacy"]]
         args += ["--columns", ",".join(columns), "--output", out]
         assert run(*args, "--report", item["dir"] / f"legacy-{kind}.json") == 0
         assert tool.manifest_of(out)["dimensions"].keys() == columns.keys()
@@ -212,9 +217,22 @@ def test_columns_split_a_combined_legacy_file_into_one_sidecar_per_method(item):
     assert check(item, sidecars, member) == 0
 
 
+def test_columns_left_out_are_reported_with_a_warning(item, capsys):
+    out = item["dir"] / "species.parquet"
+    args = ["export", *identity(item, base=False), "--enriched", item["species_sat"]]
+    args += ["--columns", ",".join(SPECIES_SAT), "--output", out]
+    assert run(*args, "--report", item["dir"] / "species.json") == 0
+    assert tool.manifest_of(out)["dimensions"].keys() == SPECIES_SAT.keys()
+    assert "columns not kept: ['PredInstance_SAT', 'PredSemantic_SAT']" in (
+        capsys.readouterr().err
+    )
+    report = json.loads((item["dir"] / "species.json").read_text())
+    assert report["dropped"] == sorted(SAT)
+
+
 def test_columns_must_exist_in_the_output(item):
     out = item["dir"] / "x.parquet"
-    args = ["export", *identity(item), "--enriched", item["sat"]]
+    args = ["export", *identity(item, base=False), "--enriched", item["sat"]]
     args += ["--columns", "PredInstance_FM", "--output", out]
     assert run(*args, "--report", item["dir"] / "x.json") == 2
 
@@ -226,3 +244,10 @@ def test_sidecars_store_the_index_delta_encoded_in_large_row_groups(item):
     index = metadata.row_group(0).column(0)
     assert index.path_in_schema == "point_index"
     assert "DELTA_BINARY_PACKED" in index.encodings
+
+
+def test_export_requires_the_columns_to_store(item):
+    out = item["dir"] / "x.parquet"
+    args = ["export", *identity(item, base=False), "--enriched", item["sat"]]
+    with pytest.raises(SystemExit):
+        run(*args, "--output", out, "--report", item["dir"] / "x.json")

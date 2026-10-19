@@ -5,7 +5,7 @@ identifiers are the Dataset item ids. Every subcommand writes one JSON report
 next to its product so the native worker can verify the published bytes
 (hashes, sizes, point counts, dimensions) without downloading point clouds.
 
-  export    base + method-enriched LAZ (+ carried parent sidecar) -> sidecar
+  export    method output LAZ + the columns to keep -> sidecar
   assemble  base + selected sidecars -> downloadable member LAZ
   check     re-assemble independently and compare against a published member
 """
@@ -41,46 +41,37 @@ def manifest_of(path):
     """The identity and dimensions a sidecar carries in its Parquet metadata."""
     import pyarrow.parquet as pq
 
-    metadata = pq.ParquetFile(path).schema_arrow.metadata or {}
-    return json.loads(metadata[b"3dtrees"])
+    return sidecar.manifest_of(pq.ParquetFile(path))
 
 
 def write_report(path, document):
     Path(path).write_text(json.dumps(document, sort_keys=True, indent=2) + "\n")
 
 
-def added_dimensions(base, enriched, carried):
-    """The enriched file's new dimensions minus those its parent owns."""
+def export(args):
     import laspy
 
-    with laspy.open(base) as a, laspy.open(enriched) as b:
-        added = set(b.header.point_format.dimension_names) - set(
-            a.header.point_format.dimension_names
-        )
-    parent = set(manifest_of(carried)["dimensions"]) if carried else set()
-    return sorted(added - parent)
-
-
-def export(args):
-    added = added_dimensions(args.base, args.enriched, args.carried)
-    # `--columns` splits a combined file (a legacy analysis holding SAT and
-    # ForestMamba) into one sidecar per method; the rest is left to its own.
-    owned = sorted(args.columns) if args.columns else added
-    missing = set(owned) - set(added)
+    with laspy.open(args.enriched) as enriched:
+        point_format = enriched.header.point_format
+        names = set(point_format.dimension_names)
+        extra = set(point_format.extra_dimension_names)
+    owned = sorted(args.columns)
+    missing = set(owned) - names
     if missing:
         raise ValueError(f"Requested columns are not in the output: {sorted(missing)}")
+    # Only the named columns are stored; any other added column is reported.
+    dropped = sorted(extra - set(owned))
+    if dropped:
+        print(f"export warning: columns not kept: {dropped}", file=sys.stderr)
     manifest = sidecar.export(
-        args.base,
         args.enriched,
         args.output,
         generation=args.generation,
         item=args.item,
         owned=owned,
-        carried=args.carried,
-        ignored=sorted(set(added) - set(owned)),
         producer={"executor": "galaxy", "tool": TOOL, "version": VERSION},
     )
-    write_report(args.report, {"item_id": args.item, **manifest})
+    write_report(args.report, {"item_id": args.item, **manifest, "dropped": dropped})
 
 
 def assemble(args):
@@ -160,21 +151,22 @@ def parser():
     root.add_argument("--version", action="version", version=VERSION)
     commands = root.add_subparsers(dest="command", required=True)
 
-    def common(command):
-        command.add_argument("--base", required=True, help="Standard base LAZ")
+    def common(command, base=True):
+        if base:
+            command.add_argument("--base", required=True, help="Standard base LAZ")
         command.add_argument("--generation", required=True, type=generation_id)
         command.add_argument("--item", required=True, type=item_id)
         command.add_argument("--report", required=True, help="JSON report path")
 
     one = commands.add_parser("export", help="Write one item's sidecar")
-    common(one)
+    common(one, base=False)
     one.add_argument("--enriched", required=True, help="Method output LAZ")
-    one.add_argument("--carried", help="Parent sidecar the method output repeats")
     one.add_argument("--output", required=True, help="Sidecar Parquet path")
     one.add_argument(
         "--columns",
+        required=True,
         type=lambda value: [c for c in value.split(",") if c],
-        help="Comma-separated dimensions to keep (default: every added one)",
+        help="Comma-separated dimensions to store",
     )
     one.set_defaults(handler=export)
 
