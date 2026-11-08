@@ -251,3 +251,49 @@ def test_export_requires_the_columns_to_store(item):
     args = ["export", *identity(item, base=False), "--enriched", item["sat"]]
     with pytest.raises(SystemExit):
         run(*args, "--output", out, "--report", item["dir"] / "x.json")
+
+
+def rejection(capsys):
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def test_export_rejects_a_scaled_owned_column_in_one_line(item, capsys):
+    cloud = laspy.read(item["base"])
+    cloud.add_extra_dim(
+        laspy.ExtraBytesParams(
+            name="Height_RCT",
+            type=np.uint16,
+            scales=np.array([0.01]),
+            offsets=np.array([0.0]),
+        )
+    )
+    cloud.write(item["dir"] / "scaled.laz")
+    out = item["dir"] / "x.parquet"
+    args = [
+        "export",
+        *identity(item, base=False),
+        "--enriched",
+        item["dir"] / "scaled.laz",
+    ]
+    args += ["--columns", "Height_RCT", "--output", out]
+    assert run(*args, "--report", item["dir"] / "x.json") == 2
+    assert rejection(capsys) == (
+        "export rejected: Owned dimensions with a scale or offset: ['Height_RCT']"
+    )
+
+
+def test_a_las_1_0_base_is_rejected_in_one_line(item, capsys):
+    # Standardization 1.2.1 passed a LAS 1.0 base through (EU job
+    # 4838ba20a6d8676512bb22649e1b19e1); laspy cannot read 1.0.
+    las = item["dir"] / "las10.las"
+    laspy.convert(laspy.read(item["base"]), file_version="1.2").write(las)
+    data = bytearray(las.read_bytes())
+    data[25] = 0  # version minor
+    las.write_bytes(bytes(data))
+    item["base"] = las
+    out = item["dir"] / "member.laz"
+    args = ["assemble", *identity(item), "--output", out]
+    assert run(*args, "--report", item["dir"] / "r.json") == 2
+    assert rejection(capsys) == "assemble rejected: LAS 1.0 is not supported"

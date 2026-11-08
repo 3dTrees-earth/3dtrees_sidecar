@@ -215,3 +215,129 @@ def test_only_named_numeric_extra_dimensions_can_be_stored(cloud, tmp_path):
                 owned=owned,
                 producer={},
             )
+
+
+@pytest.mark.parametrize(
+    "dtype, scale",
+    [(np.float32, 1.0), (np.float32, 0.01), (np.float64, 1.0), (np.int32, 0.001)],
+)
+def test_scaled_extra_bytes_keep_their_stored_values(tmp_path, dtype, scale):
+    # Datasets 1919, 2030 and 3827: a float `Range` declared with a scale
+    # came back rounded (2.93 -> 3) because it went through the scale.
+    header = laspy.LasHeader(point_format=6, version="1.4")
+    header.add_extra_dim(
+        laspy.ExtraBytesParams(
+            name="Range", type=dtype, scales=np.array([scale]), offsets=np.array([0.0])
+        )
+    )
+    base = laspy.LasData(header)
+    base.X = np.arange(5)
+    raw = np.array([2.93, 0.5302302, 17.25, -1.0, 30.7]) / (
+        1 if np.dtype(dtype).kind == "f" else scale
+    )
+    base.points.array["Range"] = raw.astype(dtype)
+    source, output = tmp_path / "base.laz", tmp_path / "assembled.laz"
+    base.write(source)
+    identity = {"generation": str(uuid4()), "item": 1}
+    assemble(source, [], output, **identity)
+    assert (
+        laspy.read(output).points.array["Range"].tobytes()
+        == laspy.read(source).points.array["Range"].tobytes()
+    )
+
+
+def test_a_rounded_scaled_extra_byte_is_still_rejected(tmp_path):
+    header = laspy.LasHeader(point_format=6, version="1.4")
+    header.add_extra_dim(
+        laspy.ExtraBytesParams(
+            name="Range",
+            type=np.float32,
+            scales=np.array([1.0]),
+            offsets=np.array([0.0]),
+        )
+    )
+    base = laspy.LasData(header)
+    base.X = np.arange(3)
+    base.points.array["Range"] = np.array([2.93, 4.2, 5.5], dtype=np.float32)
+    source, member = tmp_path / "base.laz", tmp_path / "member.laz"
+    base.write(source)
+    base.points.array["Range"] = np.array([3.0, 4.2, 5.5], dtype=np.float32)
+    base.write(member)
+    with pytest.raises(ValueError, match="dimension changed: Range"):
+        module_under_test.unchanged_files(source, member)
+
+
+def test_a_member_with_the_same_final_values_in_another_storage_is_accepted(tmp_path):
+    # The check compares final values (stored x scale + offset), as decided by
+    # Kilian on 8 Nov 2026: 293 at scale 0.01 equals 2930 at scale 0.001.
+    paths = {}
+    for name, dtype, scale, stored in (
+        ("base", np.uint16, 0.01, [293, 420, 550]),
+        ("member", np.int32, 0.001, [2930, 4200, 5500]),
+    ):
+        header = laspy.LasHeader(point_format=6, version="1.4")
+        header.add_extra_dim(
+            laspy.ExtraBytesParams(
+                name="Range",
+                type=dtype,
+                scales=np.array([scale]),
+                offsets=np.array([0.0]),
+            )
+        )
+        cloud = laspy.LasData(header)
+        cloud.X = np.arange(3)
+        cloud.points.array["Range"] = np.array(stored, dtype=dtype)
+        paths[name] = tmp_path / f"{name}.laz"
+        cloud.write(paths[name])
+    module_under_test.unchanged_files(paths["base"], paths["member"])
+
+
+def test_assembly_keeps_the_method_output_descriptions(cloud, tmp_path):
+    source, enriched, identity = cloud
+    method = laspy.read(source)
+    method.add_extra_dim(
+        laspy.ExtraBytesParams(
+            name="PredInstance_FM", type=np.uint16, description="ForestMamba instance"
+        )
+    )
+    method.PredInstance_FM = [0, 1, 1, 2, 2, 2]
+    method.write(enriched)
+    sidecar, output = tmp_path / "fm.parquet", tmp_path / "assembled.laz"
+    export(enriched, sidecar, **identity, owned=["PredInstance_FM"], producer={})
+    assemble(source, [sidecar], output, **identity)
+    dimension = laspy.read(output).point_format.dimension_by_name("PredInstance_FM")
+    assert dimension.description == "ForestMamba instance"
+    # The base keeps its own descriptions through the header copy.
+    assert laspy.read(output).point_format.dimension_by_name(
+        "unrelated"
+    ).description == (
+        laspy.read(source).point_format.dimension_by_name("unrelated").description
+    )
+
+
+def test_viewer_merge_keeps_scaled_extra_bytes_as_stored(tmp_path):
+    paths = []
+    for number, values in enumerate(([2.93, 0.53], [17.25, -1.0])):
+        header = laspy.LasHeader(point_format=6, version="1.4")
+        header.offsets = [400000 + number, 5300000, 0]
+        header.add_extra_dim(
+            laspy.ExtraBytesParams(
+                name="Range",
+                type=np.float32,
+                scales=np.array([1.0]),
+                offsets=np.array([0.0]),
+            )
+        )
+        cloud = laspy.LasData(header)
+        cloud.X = [0, 1000]
+        cloud.points.array["Range"] = np.array(values, dtype=np.float32)
+        paths.append(tmp_path / f"part{number}.laz")
+        cloud.write(paths[-1])
+    output = tmp_path / "viewer.laz"
+    module_under_test.merge_for_viewer(paths, output)
+    merged = laspy.read(output)
+    assert (
+        merged.points.array["Range"].tolist()
+        == np.array([2.93, 0.53, 17.25, -1.0], dtype=np.float32).tolist()
+    )
+    assert np.allclose(merged.x, [400000, 400010, 400001, 400011])
