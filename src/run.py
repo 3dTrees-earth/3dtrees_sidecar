@@ -20,7 +20,7 @@ from uuid import UUID
 import sidecar
 
 TOOL = "3dtrees_sidecar"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CHECK_CONTRACT = "3dtrees-sidecar-check-v1"
 
 
@@ -186,10 +186,16 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    from laspy.errors import FileVersionNotSupported
+
     try:
         args.handler(args)
     except ValueError as error:
         print(f"{args.command} rejected: {error}", file=sys.stderr)
+        return 2
+    except FileVersionNotSupported as error:
+        # laspy reads LAS 1.1 to 1.4; a LAS 1.0 base must be standardized again.
+        print(f"{args.command} rejected: LAS {error} is not supported", file=sys.stderr)
         return 2
     return 0
 

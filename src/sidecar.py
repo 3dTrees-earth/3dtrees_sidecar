@@ -31,6 +31,22 @@ def identity(generation, item):
     return {"generation": generation, "item": item}
 
 
+def _scaled(info):
+    return info.scales is not None or info.offsets is not None
+
+
+def _extra_storage(header):
+    return [
+        (
+            d.name,
+            d.dtype,
+            np.atleast_1d(d.scales).tolist(),
+            np.atleast_1d(d.offsets).tolist(),
+        )
+        for d in header.point_format.extra_dimensions
+    ]
+
+
 def manifest_of(table):
     """The identity and dimensions a sidecar carries in its Parquet schema."""
     return json.loads((table.schema_arrow.metadata or {})[b"3dtrees"])
@@ -74,6 +90,8 @@ def same_header(a, b):
 
 
 def same_points(a, b, dimensions):
+    """Compare each dimension's final value: stored value times scale plus
+    offset where the dimension declares a scale."""
     for name in dimensions:
         before, after = np.asarray(a[name]), np.asarray(b[name])
         if before.dtype != after.dtype or before.tobytes() != after.tobytes():
@@ -141,19 +159,26 @@ def export(enriched_path, output, *, generation, item, owned, producer):
             raise ValueError("Owned dimensions must be named dimensions of the output")
         if set(owned) & standard:
             raise ValueError("Standard point fields cannot be owned")
-        dtypes = {
-            n: np.dtype(header.point_format.dimension_by_name(n).dtype) for n in owned
-        }
+        infos = {n: header.point_format.dimension_by_name(n) for n in owned}
+        dtypes = {n: np.dtype(info.dtype) for n, info in infos.items()}
         if any(
             n == "point_index" or d.subdtype or d.kind not in "iuf"
             for n, d in dtypes.items()
         ):
             raise ValueError("Only scalar numeric owned dimensions are supported")
+        # A sidecar stores raw values without the ExtraBytes scale or offset,
+        # so a scaled column could not be restored. No method writes one.
+        scaled = sorted(n for n, i in infos.items() if _scaled(i))
+        if scaled:
+            raise ValueError(f"Owned dimensions with a scale or offset: {scaled}")
         manifest = {
             "contract": CONTRACT,
             **identity(generation, item),
             "points": header.point_count,
             "dimensions": {n: d.str for n, d in dtypes.items()},
+            "descriptions": {
+                n: i.description for n, i in infos.items() if i.description
+            },
             "producer": producer,
         }
         schema = pa.schema(
@@ -277,13 +302,18 @@ def assemble(base_path, sidecars, output, *, generation, item):
             }:
                 raise ValueError("Sidecar column inventory mismatch")
             dtypes = {}
+            descriptions = manifest.get("descriptions", {})
             for name, dtype in manifest["dimensions"].items():
                 dtype = np.dtype(dtype)
                 if name in header.point_format.dimension_names:
                     raise ValueError("Scientific dimension ownership collision")
                 if dtype.subdtype or dtype.kind not in "iuf":
                     raise ValueError("Scientific dimension dtype mismatch")
-                header.add_extra_dim(laspy.ExtraBytesParams(name=name, type=dtype))
+                header.add_extra_dim(
+                    laspy.ExtraBytesParams(
+                        name=name, type=dtype, description=descriptions.get(name, "")
+                    )
+                )
                 dtypes[name] = dtype
             tables.append((path, table, dtypes))
         streamed = False
@@ -302,13 +332,19 @@ def assemble(base_path, sidecars, output, *, generation, item):
     return {"output_sha256": sha256(output), "points": count}
 
 
+def copy_base_fields(chunk, result):
+    """Copy every stored base field unchanged: raw integers and the raw values
+    of scaled extra bytes, so no scale or offset is applied on the way."""
+    for name in chunk.array.dtype.names:
+        result.array[name] = chunk.array[name]
+
+
 def _assemble_streaming(base, header, tables, output):
     columns = [_OrderedColumns(path, dtypes) for path, _, dtypes in tables]
     with laspy.open(output, mode="w", header=header) as writer:
         for chunk in base.chunk_iterator(CHUNK_POINTS):
             result = laspy.ScaleAwarePointRecord.zeros(len(chunk), header=header)
-            for name in base.header.point_format.dimension_names:
-                result[name] = chunk[name]
+            copy_base_fields(chunk, result)
             for reader in columns:
                 for name, values in reader.take(len(chunk)).items():
                     result[name] = values
@@ -366,8 +402,7 @@ def _assemble_indexed(base, header, tables, output, count):
             offset = 0
             for chunk in base.chunk_iterator(CHUNK_POINTS):
                 result = laspy.ScaleAwarePointRecord.zeros(len(chunk), header=header)
-                for name in base.header.point_format.dimension_names:
-                    result[name] = chunk[name]
+                copy_base_fields(chunk, result)
                 for name, array in arrays.items():
                     result[name] = array[offset : offset + len(chunk)]
                 writer.write_points(result)
@@ -383,7 +418,9 @@ def merge_for_viewer(paths, output):
             headers.append(copy.deepcopy(reader.header))
     header = copy.deepcopy(headers[0])
     if any(
-        h.point_format != header.point_format or h.parse_crs() != header.parse_crs()
+        h.point_format != header.point_format
+        or _extra_storage(h) != _extra_storage(header)
+        or h.parse_crs() != header.parse_crs()
         for h in headers
     ):
         raise ValueError("Viewer collection requires matching dimensions and CRS")
@@ -398,9 +435,10 @@ def merge_for_viewer(paths, output):
                     result = laspy.ScaleAwarePointRecord.zeros(
                         len(chunk), header=header
                     )
-                    for dimension in chunk.point_format.dimension_names:
-                        if dimension not in {"X", "Y", "Z"}:
-                            result[dimension] = chunk[dimension]
+                    # Raw, as in assembly: scaled ExtraBytes would round.
+                    for field in chunk.array.dtype.names:
+                        if field not in {"X", "Y", "Z"}:
+                            result.array[field] = chunk.array[field]
                     for axis, scale, origin in zip(
                         ("x", "y", "z"), header.scales, header.offsets, strict=True
                     ):
